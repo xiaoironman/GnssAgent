@@ -1,6 +1,10 @@
 # This file contains the wrapper functions for the RTKLIB tools used in the project.
+import json
 import subprocess
 import os
+
+from langchain_core.utils.function_calling import convert_to_openai_tool
+from langgraph.prebuilt import ToolInvocation, ToolExecutor
 from pydantic.v1 import BaseModel, Field
 from typing import List, Optional
 from langchain_core.tools import tool
@@ -9,14 +13,17 @@ from openai import OpenAI
 from tenacity import retry, wait_random_exponential, stop_after_attempt
 
 
-GPT_MODEL = "gpt-3.5-turbo-0125"
+# GPT_MODEL = "gpt-3.5-turbo-0125"
+GPT_MODEL = "gpt-4o"
 openai_key_rtkflow = os.environ.get("OPENAI_KEY_RTKFLOW")
-
+CACHE_FOLDER = r"C:\Users\Xiao Liu\Downloads\GnssAgent\cache"
 RTKLIB_FOLDER = r"C:\GNSS\RTKLIB_bin-rtklib_2.4.3\bin"
+
+SYSTEM_PROMPT = "Don't make assumptions about what values to plug into functions. Ask for clarification if a user request is ambiguous. Maximum 1 tool call per user message. If there is any output file being generated, put it in the following cache folder: " + CACHE_FOLDER
 
 
 class Rnx2RtkpParams(BaseModel):
-    input_files: List[str] = Field(..., description="List of files. The first file should be the rover RINEX OBS file. The rest of the files should be RINEX NAV/GNAV/HNAVsp3/CLK files, etc.")
+    input_files: List[str] = Field(..., description="List of files. The first file should be the rover RINEX OBS file. Then the base station file. And finally the navigation files and other RINEX NAV/GNAV/HNAVsp3/CLK files, etc.")
     extra_commands: Optional[str] = Field(None,
                                           description="""Extra commands to be passed to the rnx2rtkp executable.
  Command options are as follows ([]:default). With -k option, the processing options are input from the 
@@ -47,7 +54,7 @@ class Rnx2RtkpParams(BaseModel):
            rover receiver ecef pos (m) for fixed or ppp-fixed mode
  -l lat lon hgt reference (base) receiver latitude/longitude/height (deg/m)
            rover latitude/longitude/height for fixed or ppp-fixed mode
- -y level  output soltion status (0:off,1:states,2:residuals) [0]
+ -y level  output solution status (0:off,1:states,2:residuals) [0]
  -x level  debug trace level (0:off) [0]
  """)
 
@@ -198,7 +205,6 @@ def convbin(file_to_convert: str, options: str = None):
 
 
 ALL_TOOLS = [rnx2rtkp, convbin]
-# ALL_TOOLS = [convert_to_openai_tool(tool) for tool in ALL_TOOLS]
 
 client = OpenAI(api_key=openai_key_rtkflow)
 
@@ -220,19 +226,41 @@ def chat_completion_request(messages, tools=None, tool_choice=None, model=GPT_MO
 
 
 if __name__ == "__main__":
-    rinex_path = r"C:\Users\Xiao Liu\Downloads\RTKFlow\test_data\31800KHz.rnx"
+    # create the tool executor object to call the tools
+    tool_executor = ToolExecutor(ALL_TOOLS)
+    # convert StructuredTool objects to OpenAI tool in dicts for later use
+    ALL_TOOLS = [convert_to_openai_tool(tool) for tool in ALL_TOOLS]
+    rinex_path = r"C:\Users\Xiao Liu\Downloads\GnssAgent\test data\combined.20o"
     messages = []
     messages.append({"role": "system",
-                     "content": "Don't make assumptions about what values to plug into functions. Ask for clarification if a user request is ambiguous."})
+                     "content": SYSTEM_PROMPT})
     messages.append({"role": "user", "content": "I want to compute the PVT solution of a RINEX file. Can you help me?"})
     chat_response = chat_completion_request(
         messages, tools=ALL_TOOLS
     )
 
     messages.append(chat_response.choices[0].message)
-    messages.append({"role": "user", "content": "The rover rinex file is at: " + rinex_path})
+    messages.append({"role": "user", "content": "The rover rinex file is at: " + rinex_path + ". The navigation files are in the same folder and all starting with the characters PLAN, the base station rinex file is UPC_combined.rnx that is also in the same folder."})
 
     chat_response = chat_completion_request(
         messages, tools=ALL_TOOLS
     )
-    print(chat_response['choices'][0]['message']['content'])
+
+    # if response is a function call, then call the tool
+    if chat_response.choices[0].finish_reason == "tool_calls":
+        tool_call = chat_response.choices[0].message.tool_calls[0]
+        function = tool_call.function
+        function_name = function.name
+        _tool_input = function.arguments
+        print(f"function_name: {function_name};\nfunction arguments: {_tool_input}")
+    else:
+        print(chat_response.choices[0].message.content)
+
+    # call the tool
+    action = ToolInvocation(
+        tool=function_name,
+        tool_input=json.loads(_tool_input),
+    )
+
+    response = tool_executor.invoke(action)
+    print(response)
